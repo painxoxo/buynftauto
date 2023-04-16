@@ -1,92 +1,84 @@
 import requests
 import time
-from web3 import Web3
-from dotenv import dotenv_values
 
-# Load environment variables
-config = dotenv_values(".env")
+# Set your wallet address here
+WALLET_ADDRESS = ''
 
-# Initialize Web3
-web3 = Web3(Web3.HTTPProvider(config["WEB3_HTTP_PROVIDER"]))
+# Set the collection contract address and token ID range
+CONTRACT_ADDRESS = '0xe4605d46fd0b3f8329d936a8b258d69276cba264'
+TOKEN_ID_RANGE = range(1, 101)
 
-# Set OpenSea API endpoint and headers
-OPENSEA_API_ENDPOINT = "https://api.opensea.io/api/v1"
-OPENSEA_API_HEADERS = {"Accept": "application/json"}
+# Set the maximum price you are willing to pay in ETH
+MAX_PRICE = 0.1
 
-# Set collection address and ABI
-COLLECTION_ADDRESS = config["COLLECTION_ADDRESS"]
-COLLECTION_ABI = config["COLLECTION_ABI"]
+# Set the delay (in seconds) between API requests
+DELAY = 5
 
-# Set threshold price in ETH
-THRESHOLD_PRICE_ETH = float(config["THRESHOLD_PRICE_ETH"])
+# Set the minimum acceptable floor price as a percentage of the lowest listed price
+MIN_FLOOR_PRICE_PERCENT = 80
 
-# Set gas parameters
-GAS_PRICE = int(config["GAS_PRICE"])
-GAS_LIMIT = int(config["GAS_LIMIT"])
+# Set the number of retries for API requests in case of errors
+NUM_RETRIES = 3
 
-# Set API key for authenticated requests
-API_KEY = config.get("OPENSEA_API_KEY", None)
-if API_KEY:
-    OPENSEA_API_HEADERS["X-API-KEY"] = API_KEY
+# Set the retry delay (in seconds) between retries
+RETRY_DELAY = 5
 
-# Initialize the contract instance
-contract = web3.eth.contract(address=COLLECTION_ADDRESS, abi=COLLECTION_ABI)
 
-def get_nfts_for_sale():
-    # Build the OpenSea API endpoint URL
-    endpoint = f"{OPENSEA_API_ENDPOINT}/assets"
-    # Set query parameters for collection, order, and sale status
-    query_params = {
-        "collection": COLLECTION_ADDRESS,
-        "order_direction": "desc",
-        "offset": 0,
-        "limit": 50,
-        "sale_kind": 0,
-        "is_english": True,
-        "include_bundled": False,
-    }
-    # Send the HTTP request
-    response = requests.get(endpoint, params=query_params, headers=OPENSEA_API_HEADERS)
-    # Raise an exception if the request was not successful
-    response.raise_for_status()
-    # Parse the response JSON
-    assets = response.json()["assets"]
-    # Filter the assets by price
-    assets_for_sale = []
-    for asset in assets:
-        if "sell_orders" in asset and asset["sell_orders"] is not None:
-            price = float(asset["sell_orders"][0]["current_price"]) / 10 ** 18
-            if price <= THRESHOLD_PRICE_ETH:
-                assets_for_sale.append(asset)
-    return assets_for_sale
+def get_lowest_price(nft):
+    """Returns the lowest listed price of an NFT, or None if the NFT is not listed."""
+    try:
+        response = requests.get(f'https://api.opensea.io/api/v1/assets?order_direction=asc&offset=0&limit=1&asset_contract_address={nft["contract"]}&token_ids={nft["token_id"]}')
+        response.raise_for_status()
+        data = response.json()
+        if data['assets'] and 'current_price' in data['assets'][0]:
+            return float(data['assets'][0]['current_price']) / 10**data['assets'][0]['payment_token']['decimals']
+        else:
+            return None
+    except (requests.exceptions.RequestException, ValueError):
+        return None
 
-def buy_nft(wallet_address, nft_asset):
-    # Get the asset details
-    asset_contract_address = nft_asset["asset_contract"]["address"]
-    token_id = nft_asset["token_id"]
-    # Build the transaction parameters
-    tx_params = {
-        "from": wallet_address,
-        "to": asset_contract_address,
-        "value": nft_asset["sell_orders"][0]["current_price"],
-        "gas": GAS_LIMIT,
-        "gasPrice": GAS_PRICE
-    }
-    # Create the transaction object
-    txn = contract.functions.safeTransferFrom(wallet_address, web3.toChecksumAddress(config["BUYER_ADDRESS"]), token_id).buildTransaction(tx_params)
-    # Sign and send the transaction
-    signed_txn = web3.eth.account.sign_transaction(txn, private_key=config["BUYER_PRIVATE_KEY"])
-    txn_hash = web3.eth.send_raw_transaction(signed_txn.rawTransaction)
-    # Wait for the transaction to be confirmed
-    receipt = None
-    while receipt is None:
-        receipt = web3.eth.getTransactionReceipt(txn_hash)
-        time.sleep(5)
-    return receipt
 
-# Get the assets for sale
-assets_for_sale = get_nfts_for_sale()
+def is_floor_price_acceptable(nft):
+    """Returns True if the floor price of an NFT is acceptable, False otherwise."""
+    lowest_price = get_lowest_price(nft)
+    if lowest_price is None:
+        return False
+    else:
+        floor_price = lowest_price * MIN_FLOOR_PRICE_PERCENT / 100
+        return floor_price <= MAX_PRICE
 
-# Buy each asset that is below the threshold price
-for asset in assets_for_sale:
-    try
+
+def buy_nft(nft):
+    """Buys an NFT."""
+    try:
+        response = requests.post(f'https://api.opensea.io/wyvern/v1/orders', json={
+            'maker': nft['seller'],
+            'taker': WALLET_ADDRESS,
+            'maker_fee': '0',
+            'taker_fee': '0',
+            'fee_recipient': '0x0000000000000000000000000000000000000000',
+            'payment_token': {
+                'address': nft['payment_token'],
+                'decimals': nft['payment_token_decimals']
+            },
+            'quantity': 1,
+            'price': str(nft['current_price']),
+            'expiration_time': int(time.time()) + 60 * 60 * 24 * 7,  # Set the order expiration time to one week from now
+            'v': 27,
+            'r': '0x' + '0' * 64,
+            's': '0x' + '0' * 64
+        })
+        response.raise_for_status()
+    except (requests.exceptions.RequestException, ValueError):
+        return False
+    else:
+        return True
+
+
+def main():
+    for token_id in TOKEN_ID_RANGE:
+        nft = {'contract': CONTRACT_ADDRESS, 'token_id': token_id}
+        for i in range(NUM_RETRIES):
+            try:
+                response = requests.get(f'https://api.opensea.io/api/v1/asset/{nft["contract"]}/{nft["token_id"]}')
+                response.raise_for_status()
