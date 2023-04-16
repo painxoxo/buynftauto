@@ -1,0 +1,92 @@
+import requests
+import time
+from web3 import Web3
+from dotenv import dotenv_values
+
+# Load environment variables
+config = dotenv_values(".env")
+
+# Initialize Web3
+web3 = Web3(Web3.HTTPProvider(config["WEB3_HTTP_PROVIDER"]))
+
+# Set OpenSea API endpoint and headers
+OPENSEA_API_ENDPOINT = "https://api.opensea.io/api/v1"
+OPENSEA_API_HEADERS = {"Accept": "application/json"}
+
+# Set collection address and ABI
+COLLECTION_ADDRESS = config["COLLECTION_ADDRESS"]
+COLLECTION_ABI = config["COLLECTION_ABI"]
+
+# Set threshold price in ETH
+THRESHOLD_PRICE_ETH = float(config["THRESHOLD_PRICE_ETH"])
+
+# Set gas parameters
+GAS_PRICE = int(config["GAS_PRICE"])
+GAS_LIMIT = int(config["GAS_LIMIT"])
+
+# Set API key for authenticated requests
+API_KEY = config.get("OPENSEA_API_KEY", None)
+if API_KEY:
+    OPENSEA_API_HEADERS["X-API-KEY"] = API_KEY
+
+# Initialize the contract instance
+contract = web3.eth.contract(address=COLLECTION_ADDRESS, abi=COLLECTION_ABI)
+
+def get_nfts_for_sale():
+    # Build the OpenSea API endpoint URL
+    endpoint = f"{OPENSEA_API_ENDPOINT}/assets"
+    # Set query parameters for collection, order, and sale status
+    query_params = {
+        "collection": COLLECTION_ADDRESS,
+        "order_direction": "desc",
+        "offset": 0,
+        "limit": 50,
+        "sale_kind": 0,
+        "is_english": True,
+        "include_bundled": False,
+    }
+    # Send the HTTP request
+    response = requests.get(endpoint, params=query_params, headers=OPENSEA_API_HEADERS)
+    # Raise an exception if the request was not successful
+    response.raise_for_status()
+    # Parse the response JSON
+    assets = response.json()["assets"]
+    # Filter the assets by price
+    assets_for_sale = []
+    for asset in assets:
+        if "sell_orders" in asset and asset["sell_orders"] is not None:
+            price = float(asset["sell_orders"][0]["current_price"]) / 10 ** 18
+            if price <= THRESHOLD_PRICE_ETH:
+                assets_for_sale.append(asset)
+    return assets_for_sale
+
+def buy_nft(wallet_address, nft_asset):
+    # Get the asset details
+    asset_contract_address = nft_asset["asset_contract"]["address"]
+    token_id = nft_asset["token_id"]
+    # Build the transaction parameters
+    tx_params = {
+        "from": wallet_address,
+        "to": asset_contract_address,
+        "value": nft_asset["sell_orders"][0]["current_price"],
+        "gas": GAS_LIMIT,
+        "gasPrice": GAS_PRICE
+    }
+    # Create the transaction object
+    txn = contract.functions.safeTransferFrom(wallet_address, web3.toChecksumAddress(config["BUYER_ADDRESS"]), token_id).buildTransaction(tx_params)
+    # Sign and send the transaction
+    signed_txn = web3.eth.account.sign_transaction(txn, private_key=config["BUYER_PRIVATE_KEY"])
+    txn_hash = web3.eth.send_raw_transaction(signed_txn.rawTransaction)
+    # Wait for the transaction to be confirmed
+    receipt = None
+    while receipt is None:
+        receipt = web3.eth.getTransactionReceipt(txn_hash)
+        time.sleep(5)
+    return receipt
+
+# Get the assets for sale
+assets_for_sale = get_nfts_for_sale()
+
+# Buy each asset that is below the threshold price
+for asset in assets_for_sale:
+    try
